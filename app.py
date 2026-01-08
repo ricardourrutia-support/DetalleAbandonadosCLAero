@@ -1,281 +1,243 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
-import glob
-import os
-import sys
+
+# Configuración de la página
+st.set_page_config(page_title="Reporte Abandonos", layout="wide")
+st.title("✈️ Generador de Reporte: Detalle Pasajeros Abandonos")
 
 # =============================================================================
-# CONFIGURACIÓN
+# FUNCIONES DE CACHÉ (LA CLAVE DE LA VELOCIDAD)
 # =============================================================================
 
-# Definición de rutas (puedes cambiarlas si mueves los archivos)
-PATH_MASTER = "CL_Aeropuerto_Master_Compensaciones.xlsx"  # O .csv
-PATH_RESERVAS = "Detalle Reservas_Full Data.csv"
-FOLDER_TRANSACCIONES = "transacciones" # Carpeta donde pondrás los csv de transacciones
-OUTPUT_FILE = "Reporte_Detalle_Pasajeros_Abandonos.csv"
-
-# =============================================================================
-# FUNCIONES AUXILIARES (ROBUSTEZ)
-# =============================================================================
-
-def read_robust_file(filepath):
+@st.cache_data(show_spinner=False)
+def load_data(file_master, file_reservas, files_transacciones):
     """
-    Intenta leer un archivo data frame soportando .xlsx y .csv 
-    con detección automática de separadores (',' o ';').
+    Carga y procesa los datos. Al usar cache, esto solo se ejecuta
+    cuando cambian los archivos subidos.
     """
-    if not os.path.exists(filepath):
-        print(f"❌ Error: No se encuentra el archivo: {filepath}")
-        sys.exit(1)
-
-    print(f"   Leyendo: {os.path.basename(filepath)}...")
     
-    # Si es Excel
-    if filepath.endswith('.xlsx') or filepath.endswith('.xls'):
-        return pd.read_excel(filepath)
+    # 1. Carga Master
+    # -----------------------------------------------------
+    if file_master.name.endswith('.csv'):
+        df_master = pd.read_csv(file_master)
+    else:
+        df_master = pd.read_excel(file_master)
     
-    # Si es CSV, probamos delimitadores
+    # 2. Carga Reservas (Detectando separador)
+    # -----------------------------------------------------
     try:
-        # Intento 1: Coma
-        df = pd.read_csv(filepath, sep=',')
-        if len(df.columns) < 2: # Sospechoso, probamos punto y coma
-            raise ValueError("Posible error de delimitador")
-        return df
+        df_reservas = pd.read_csv(file_reservas, sep=';')
+        if len(df_reservas.columns) < 2: 
+            file_reservas.seek(0)
+            df_reservas = pd.read_csv(file_reservas, sep=',')
     except:
-        try:
-            # Intento 2: Punto y coma
-            df = pd.read_csv(filepath, sep=';')
-            return df
-        except Exception as e:
-            print(f"❌ Error crítico leyendo {filepath}: {e}")
-            sys.exit(1)
+        file_reservas.seek(0)
+        df_reservas = pd.read_csv(file_reservas, sep=',')
+
+    # 3. Carga Transacciones (Múltiples archivos)
+    # -----------------------------------------------------
+    df_list = []
+    if files_transacciones:
+        for f in files_transacciones:
+            try:
+                temp = pd.read_csv(f, engine='python') # engine python es más robusto
+                df_list.append(temp)
+            except Exception as e:
+                st.warning(f"No se pudo leer {f.name}: {e}")
+        
+        if df_list:
+            df_transacciones = pd.concat(df_list, ignore_index=True)
+        else:
+            df_transacciones = pd.DataFrame()
+    else:
+        df_transacciones = pd.DataFrame(columns=['Id Reserva', 'Modo', 'F.Desde Aerop', 'F.Hacia Aerop'])
+
+    return df_master, df_reservas, df_transacciones
 
 def clean_id(x):
-    """Normaliza los IDs para asegurar que el cruce (merge) funcione."""
-    if pd.isna(x):
-        return np.nan
+    if pd.isna(x): return np.nan
     s = str(x).strip()
-    if s.endswith('.0'):
-        return s[:-2]
+    if s.endswith('.0'): return s[:-2]
     return s
 
-def clean_and_parse_date_spanish(s):
-    """
-    Convierte fechas complejas tipo '16-12-2025, 12:00:00 a. m.' a datetime.
-    Maneja abreviaciones en español y comas.
-    """
-    if pd.isna(s) or str(s).strip() == "":
-        return pd.NaT
-    
-    s = str(s).strip().lower()
-    # Limpieza de caracteres problemáticos
-    s = s.replace(',', '')
-    s = s.replace('.', '') # a.m. -> am
+def clean_date_spanish(s):
+    if pd.isna(s) or str(s).strip() == "": return pd.NaT
+    s = str(s).strip().lower().replace(',', '').replace('.', '')
     s = s.replace('p m', 'pm').replace('a m', 'am')
-    s = s.replace(' p m', 'pm').replace(' a m', 'am')
-    
-    # Mapeo simple de normalización por si quedan variantes
-    s = s.replace('p.m.', 'pm').replace('a.m.', 'am')
-    
     try:
-        # Intentar formato día primero
         return pd.to_datetime(s, dayfirst=True)
     except:
         return pd.NaT
 
 # =============================================================================
-# LÓGICA PRINCIPAL
+# INTERFAZ DE USUARIO
 # =============================================================================
 
-def main():
-    print("🚀 Iniciando generación del reporte 'Detalle Pasajeros Abandonos'...\n")
+st.sidebar.header("📂 Carga de Archivos")
 
-    # 1. CARGA DE DATOS
-    # ---------------------------------------------------------
-    print("1️⃣  Cargando archivos base...")
-    df_master = read_robust_file(PATH_MASTER)
-    df_reservas = read_robust_file(PATH_RESERVAS)
+uploaded_master = st.sidebar.file_uploader("1. Máster Compensaciones (.xlsx/.csv)", type=['xlsx', 'csv'])
+uploaded_reservas = st.sidebar.file_uploader("2. Detalle Reservas (.csv)", type=['csv'])
+uploaded_trans = st.sidebar.file_uploader("3. Transacciones (.csv)", type=['csv'], accept_multiple_files=True)
 
-    print(f"2️⃣  Buscando transacciones en carpeta '{FOLDER_TRANSACCIONES}'...")
-    all_trans_files = glob.glob(os.path.join(FOLDER_TRANSACCIONES, "*.csv"))
+if uploaded_master and uploaded_reservas:
     
-    if not all_trans_files:
-        print(f"⚠️  ADVERTENCIA: No se encontraron archivos CSV en la carpeta '{FOLDER_TRANSACCIONES}'.")
-        df_transacciones = pd.DataFrame(columns=['Id Reserva', 'Modo', 'F.Desde Aerop', 'F.Hacia Aerop'])
-    else:
-        print(f"   Se encontraron {len(all_trans_files)} archivos de transacciones. Unificando...")
-        df_list = []
-        for f in all_trans_files:
-            try:
-                # Usamos read_csv directo para transacciones (asumiendo formato consistente)
-                # pero con manejo de errores por si acaso
-                temp_df = pd.read_csv(f, sep=None, engine='python') 
-                df_list.append(temp_df)
-            except Exception as e:
-                print(f"   ⚠️ Error leyendo {f}: {e}")
+    if st.button("🚀 Generar Reporte"):
         
-        if df_list:
-            df_transacciones = pd.concat(df_list, ignore_index=True)
-        else:
-             df_transacciones = pd.DataFrame()
+        with st.spinner('Procesando datos...'):
+            # 1. CARGA (Con Cache)
+            df_master, df_reservas, df_trans = load_data(uploaded_master, uploaded_reservas, uploaded_trans)
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-    # 2. PREPARACIÓN Y LIMPIEZA
-    # ---------------------------------------------------------
-    print("\n3️⃣  Limpiando datos y normalizando IDs...")
-    
-    # Estandarización de IDs
-    # Ajusta nombres de columna según tus archivos reales
-    # Master
-    col_id_master = 'id_reserva'
-    df_master['id_key'] = df_master[col_id_master].apply(clean_id)
+            # 2. LIMPIEZA
+            status_text.text("Normalizando IDs...")
+            df_master['id_key'] = df_master['id_reserva'].apply(clean_id)
+            df_reservas['id_key'] = df_reservas['id_reservation_id'].apply(clean_id)
+            
+            if not df_trans.empty and 'Id Reserva' in df_trans.columns:
+                df_trans['id_key'] = df_trans['Id Reserva'].apply(clean_id)
+            else:
+                df_trans['id_key'] = np.nan
+            
+            progress_bar.progress(30)
+            
+            # 3. FECHAS
+            status_text.text("Analizando fechas (formato español)...")
+            df_reservas['tm_start_dt'] = pd.to_datetime(df_reservas['tm_start_local_at'], dayfirst=True, errors='coerce')
+            
+            if not df_trans.empty:
+                # Optimizacion: Vectorizar limpieza básica antes de apply si es posible, 
+                # pero el apply aquí es seguro porque está cacheado si no cambia el input.
+                df_trans['F.Desde Aerop_dt'] = df_trans['F.Desde Aerop'].apply(clean_date_spanish)
+                df_trans['F.Hacia Aerop_dt'] = df_trans['F.Hacia Aerop'].apply(clean_date_spanish)
+            else:
+                df_trans['F.Desde Aerop_dt'] = pd.NaT
+                df_trans['F.Hacia Aerop_dt'] = pd.NaT
+                df_trans['Modo'] = np.nan
 
-    # Reservas (Journey)
-    col_id_reservas = 'id_reservation_id'
-    df_reservas['id_key'] = df_reservas[col_id_reservas].apply(clean_id)
-    
-    # Transacciones
-    col_id_trans = 'Id Reserva'
-    if col_id_trans in df_transacciones.columns:
-        df_transacciones['id_key'] = df_transacciones[col_id_trans].apply(clean_id)
-    else:
-        df_transacciones['id_key'] = np.nan
+            progress_bar.progress(50)
 
-    # Parseo de Fechas
-    print("   Procesando fechas (esto puede tomar unos segundos)...")
-    
-    # Fecha en Reservas
-    col_fecha_reserva = 'tm_start_local_at'
-    df_reservas['tm_start_dt'] = pd.to_datetime(df_reservas[col_fecha_reserva], dayfirst=True, errors='coerce')
+            # 4. MERGE
+            status_text.text("Cruzando bases de datos...")
+            merged = pd.merge(df_master, df_reservas[['id_key', 'tm_start_dt']], on='id_key', how='left')
+            merged = pd.merge(merged, df_trans[['id_key', 'Modo', 'F.Desde Aerop_dt', 'F.Hacia Aerop_dt']], on='id_key', how='left')
+            
+            progress_bar.progress(70)
 
-    # Fechas en Transacciones
-    if not df_transacciones.empty:
-        df_transacciones['F.Desde Aerop_dt'] = df_transacciones['F.Desde Aerop'].apply(clean_and_parse_date_spanish)
-        df_transacciones['F.Hacia Aerop_dt'] = df_transacciones['F.Hacia Aerop'].apply(clean_and_parse_date_spanish)
-    else:
-        df_transacciones['F.Desde Aerop_dt'] = pd.NaT
-        df_transacciones['F.Hacia Aerop_dt'] = pd.NaT
-        df_transacciones['Modo'] = np.nan
+            # 5. LÓGICA DE NEGOCIO (OPTIMIZADA CON NUMPY - VECTORIZACIÓN)
+            # Esto es mucho más rápido que .apply(axis=1)
+            status_text.text("Calculando lógica de negocio...")
+            
+            # Condiciones para numpy.select
+            # C1: Existe fecha en Reservas Journey
+            c1 = merged['tm_start_dt'].notna()
+            
+            # C2: No existe Modo (no cruzó con Transacciones) -> NaT
+            c2 = merged['Modo'].isna()
+            
+            # C3: Modo Round o ambas fechas existen -> Manual
+            c3 = (merged['Modo'] == 'Round') | (merged['F.Desde Aerop_dt'].notna() & merged['F.Hacia Aerop_dt'].notna())
+            
+            # C4: Existe Desde
+            c4 = merged['F.Desde Aerop_dt'].notna()
+            
+            # C5: Existe Hacia
+            c5 = merged['F.Hacia Aerop_dt'].notna()
 
-    # 3. CRUCE DE INFORMACIÓN (JOINS)
-    # ---------------------------------------------------------
-    print("4️⃣  Cruzando bases de datos...")
+            # Definición de valores resultantes en orden de prioridad
+            # Nota: np.select requiere que todos los outputs sean del mismo tipo.
+            # Convertiremos todo a string temporalmente para manejar "Ingresar Manualmente" mezclado con fechas.
+            
+            merged['Calc_Temp'] = np.select(
+                [c1, c2, c3, c4, c5], 
+                [
+                    merged['tm_start_dt'],          # Prioridad 1
+                    pd.NaT,                         # Prioridad 2 (Vacío)
+                    "Ingresar Manualmente",         # Prioridad 3
+                    merged['F.Desde Aerop_dt'],     # Prioridad 4
+                    merged['F.Hacia Aerop_dt']      # Prioridad 5
+                ], 
+                default=pd.NaT
+            )
 
-    # Cruce 1: Master + Reservas
-    merged = pd.merge(df_master, 
-                      df_reservas[['id_key', 'tm_start_dt']], 
-                      on='id_key', 
-                      how='left')
+            progress_bar.progress(90)
 
-    # Cruce 2: Resultado + Transacciones
-    merged = pd.merge(merged, 
-                      df_transacciones[['id_key', 'Modo', 'F.Desde Aerop_dt', 'F.Hacia Aerop_dt']], 
-                      on='id_key', 
-                      how='left')
+            # 6. FORMATO FINAL
+            status_text.text("Formateando salida...")
+            
+            def format_output_date(val):
+                if isinstance(val, str): return val # "Ingresar Manualmente"
+                if pd.isna(val): return ""
+                return val.strftime('%d/%m/%Y')
 
-    # 4. LÓGICA DE NEGOCIO (Date Calculation)
-    # ---------------------------------------------------------
-    print("5️⃣  Calculando 'Tm_start_local_at' real...")
+            def format_output_hour(val):
+                if isinstance(val, str) or pd.isna(val): return ""
+                return val.hour
+            
+            def format_output_full(val):
+                if isinstance(val, str): return val
+                if pd.isna(val): return ""
+                return val.strftime('%d/%m/%Y %H:%M:%S')
 
-    def get_final_tm(row):
-        # 1. Prioridad: Base de Reservas (Journey)
-        if pd.notna(row['tm_start_dt']):
-            return row['tm_start_dt']
-        
-        # 2. Revisar Transacciones
-        if pd.isna(row['Modo']):
-            return pd.NaT # No encontrado en ninguna base
-        
-        # Caso RoundTrip o Conflicto
-        if str(row['Modo']).strip() == 'Round':
-            return "Ingresar Manualmente"
-        
-        has_desde = pd.notna(row['F.Desde Aerop_dt'])
-        has_hacia = pd.notna(row['F.Hacia Aerop_dt'])
-        
-        if has_desde and has_hacia:
-            return "Ingresar Manualmente"
-        elif has_desde:
-            return row['F.Desde Aerop_dt']
-        elif has_hacia:
-            return row['F.Hacia Aerop_dt']
-        else:
-            # Modo existe pero fechas vacías
-            return pd.NaT
+            merged['Fecha'] = merged['Calc_Temp'].apply(format_output_date)
+            merged['Hora'] = merged['Calc_Temp'].apply(format_output_hour)
+            merged['Tm_start_local_at'] = merged['Calc_Temp'].apply(format_output_full)
 
-    merged['Calculated_Start'] = merged.apply(get_final_tm, axis=1)
+            # Columnas finales
+            final_cols = {
+                'Fecha_x': 'Datetime Compensación',
+                'Dirección de correo electrónico': 'Dirección de correo electrónico',
+                'Numero': 'Numero',
+                'Correo registrado en Cabify para realizar la carga': 'Correo registrado en Cabify para realizar la carga',
+                'Total Compensación': 'Monto a compensar',
+                'Motivo compensación': 'Motivo compensación',
+                'id_reserva': 'Id_reserva',
+                'Clasificación': 'Compensación Aeropuerto',
+                'Tm_start_local_at': 'Tm_start_local_at',
+                'Fecha': 'Fecha',
+                'Hora': 'Hora'
+            }
+            
+            # Manejo de nombres de columna (Fecha_x vs Fecha)
+            if 'Fecha' in merged.columns and 'Fecha_x' not in merged.columns and 'Datetime Compensación' not in merged.columns:
+                 # Si Pandas no renombró Fecha a Fecha_x, buscamos la original
+                 if 'Fecha_y' in merged.columns: # Significa que la original se llama Fecha_x
+                     pass
+                 else:
+                     # Intentar encontrar la columna fecha original del master
+                     final_cols['Fecha'] = 'Fecha_Calculada' # Renombramos nuestra calculada para no chocar
+                     merged.rename(columns={'Fecha': 'Fecha_Calculada'}, inplace=True)
+                     # Asumimos que la fecha master sigue llamándose Fecha o Fecha_x
 
-    # 5. FORMATO FINAL
-    # ---------------------------------------------------------
-    print("6️⃣  Dando formato final al reporte...")
+            # Renombrar seguro
+            available_cols = []
+            for k, v in final_cols.items():
+                if k in merged.columns:
+                    merged.rename(columns={k: v}, inplace=True)
+                    available_cols.append(v)
+                elif k == 'Fecha_x' and 'Fecha' in merged.columns: 
+                     # Caso borde
+                     merged.rename(columns={'Fecha': 'Datetime Compensación'}, inplace=True)
+                     available_cols.append('Datetime Compensación')
 
-    # Extraer columnas Fecha y Hora
-    def extract_date_str(val):
-        if isinstance(val, str): return val 
-        if pd.isna(val): return ""
-        return val.strftime('%d/%m/%Y')
+            output_df = merged[available_cols]
 
-    def extract_hour_str(val):
-        if isinstance(val, str) or pd.isna(val): return ""
-        return int(val.hour)
-    
-    def format_full_datetime(val):
-        if isinstance(val, str): return val
-        if pd.isna(val): return ""
-        return val.strftime('%d/%m/%Y %H:%M:%S')
+            progress_bar.progress(100)
+            status_text.success("✅ ¡Reporte generado exitosamente!")
+            
+            # VISTA PREVIA
+            st.dataframe(output_df.head(10))
+            
+            # BOTÓN DE DESCARGA
+            csv = output_df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 Descargar Reporte Completo",
+                data=csv,
+                file_name="Detalle_Pasajeros_Abandonos.csv",
+                mime="text/csv"
+            )
 
-    merged['Fecha'] = merged['Calculated_Start'].apply(extract_date_str)
-    merged['Hora'] = merged['Calculated_Start'].apply(extract_hour_str)
-    merged['Tm_start_local_at'] = merged['Calculated_Start'].apply(format_full_datetime)
-
-    # Mapeo de columnas finales
-    column_mapping = {
-        'Fecha_x': 'Datetime Compensación', # Fecha original del master (usualmente se llama Fecha y al cruzar pd le pone _x)
-        'Dirección de correo electrónico': 'Dirección de correo electrónico',
-        'Numero': 'Numero',
-        'Correo registrado en Cabify para realizar la carga': 'Correo registrado en Cabify para realizar la carga',
-        'Total Compensación': 'Monto a compensar',
-        'Motivo compensación': 'Motivo compensación',
-        'id_reserva': 'id_reserva',
-        'Clasificación': 'Compensación Aeropuerto',
-        'Tm_start_local_at': 'Tm_start_local_at',
-        'Fecha': 'Fecha', # Nuestra fecha calculada
-        'Hora': 'Hora'
-    }
-
-    # Verificar si 'Fecha' del master sufrió rename por el merge
-    if 'Fecha' in merged.columns and 'Fecha_x' not in merged.columns:
-        column_mapping['Fecha'] = 'Datetime Compensación' # Si no hubo colisión de nombres
-        # Pero cuidado, tenemos nuestra nueva columna 'Fecha' calculada. 
-        # Pandas probablemente renombró la del Master a Fecha_x si creamos una nueva llamada Fecha.
-        # Asumiremos que la del Master es la primera col.
-    
-    # Manejo seguro de columnas existentes
-    final_cols = []
-    for col_origin, col_dest in column_mapping.items():
-        if col_origin in merged.columns:
-            merged.rename(columns={col_origin: col_dest}, inplace=True)
-            final_cols.append(col_dest)
-        elif col_origin == 'Fecha_x' and 'Fecha_x' not in merged.columns and 'Fecha_y' in merged.columns:
-             # Caso raro de colisión inversa
-             merged.rename(columns={'Fecha_x': 'Datetime Compensación'}, inplace=True)
-
-    # Filtrar solo las columnas deseadas que existan
-    # Definimos el orden deseado
-    desired_order = [
-        'Datetime Compensación', 'Dirección de correo electrónico', 'Numero', 
-        'Correo registrado en Cabify para realizar la carga', 'Monto a compensar', 
-        'Motivo compensación', 'id_reserva', 'Compensación Aeropuerto', 
-        'Tm_start_local_at', 'Fecha', 'Hora'
-    ]
-    
-    # Seleccionamos solo las que logramos generar
-    valid_cols = [c for c in desired_order if c in merged.columns]
-    output_df = merged[valid_cols]
-
-    # Guardar
-    output_df.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig') # utf-8-sig para que Excel abra bien los tildes
-    
-    print(f"\n✅ ¡ÉXITO! Reporte generado: {OUTPUT_FILE}")
-    print(f"   Filas procesadas: {len(output_df)}")
-
-if __name__ == "__main__":
-    main()
+else:
+    st.info("👋 Por favor carga los archivos 'Master' y 'Reservas' en el menú lateral para comenzar.")
